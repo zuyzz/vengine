@@ -14,7 +14,7 @@ enum Commands {
     #[command(about = "List all audio devices")]
     Devices(devices::DevicesCmd),
 
-    #[command(about = "Record audio to a WAV file")]
+    #[command(about = "Record audio to a file (format from extension)")]
     Record(record::RecordCmd),
 }
 

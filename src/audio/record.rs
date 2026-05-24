@@ -1,4 +1,6 @@
 use std::{
+    io::Write,
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -22,16 +24,7 @@ pub fn record_to_file(path: &str) -> anyhow::Result<()> {
 
     println!("Recording config: {:#?}", config);
 
-    let spec = hound::WavSpec {
-        channels: config.channels,
-        sample_rate: config.sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    let writer = hound::WavWriter::create(path, spec)?;
-    let writer = Arc::new(Mutex::new(Some(writer)));
-
+    let samples: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
     let is_recording = Arc::new(AtomicBool::new(true));
 
     {
@@ -43,16 +36,16 @@ pub fn record_to_file(path: &str) -> anyhow::Result<()> {
         })?;
     }
 
-    let writer_clone = writer.clone();
+    let samples_clone = samples.clone();
 
     let err_fn = |err| {
         eprintln!("Stream error: {}", err);
     };
 
     let stream = match sample_format {
-        cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config, writer_clone, err_fn)?,
-        cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config, writer_clone, err_fn)?,
-        cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config, writer_clone, err_fn)?,
+        cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config, samples_clone, err_fn)?,
+        cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config, samples_clone, err_fn)?,
+        cpal::SampleFormat::U16 => build_stream::<u16>(&device, &config, samples_clone, err_fn)?,
         _ => panic!("Unsupported sample format"),
     };
 
@@ -66,7 +59,11 @@ pub fn record_to_file(path: &str) -> anyhow::Result<()> {
 
     drop(stream);
 
-    writer.lock().unwrap().take().unwrap().finalize()?;
+    let recorded = samples.lock().unwrap().clone();
+    let channels = config.channels;
+    let sample_rate = config.sample_rate;
+
+    encode_via_ffmpeg(path, &recorded, channels, sample_rate)?;
 
     println!("Saved recording to {}", path);
 
@@ -76,7 +73,7 @@ pub fn record_to_file(path: &str) -> anyhow::Result<()> {
 fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    writer: Arc<Mutex<Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>>>,
+    samples: Arc<Mutex<Vec<i16>>>,
     err_fn: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, anyhow::Error>
 where
@@ -86,13 +83,11 @@ where
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
-            let mut writer = writer.lock().unwrap();
+            let mut samples = samples.lock().unwrap();
 
-            if let Some(writer) = writer.as_mut() {
-                for sample in data {
-                    let sample: i16 = sample.to_sample::<i16>();
-                    let _ = writer.write_sample(sample);
-                }
+            for sample in data {
+                let sample: i16 = sample.to_sample::<i16>();
+                samples.push(sample);
             }
         },
         err_fn,
@@ -100,4 +95,32 @@ where
     )?;
 
     Ok(stream)
+}
+
+pub fn encode_via_ffmpeg(path: &str, samples: &[i16], channels: u16, sample_rate: u32) -> anyhow::Result<()> {
+    let mut child = Command::new("C:\\Program Files\\FFMPEG\\ffmpeg-8.1.1-full_build\\bin\\ffmpeg.exe")
+        .args(["-y", "-f", "s16le", "-ar", &sample_rate.to_string()])
+        .args(["-ac", &channels.to_string(), "-i", "pipe:0"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to launch ffmpeg: {e}"))?;
+
+    let mut stdin = child.stdin.take().unwrap();
+    let bytes = unsafe {
+        std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 2)
+    };
+    stdin.write_all(bytes)?;
+    drop(stdin);
+
+    let output = child.wait_with_output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ffmpeg failed: {stderr}");
+    }
+
+    Ok(())
 }
